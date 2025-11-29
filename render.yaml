@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: aqi-prediction-api
+    name: aqi-api
     runtime: python
     region: singapore
     plan: free
@@ -9,6 +9,4 @@ services:
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.12
-      - key: PORT
-        value: 10000
+        value: "3.10.12"
