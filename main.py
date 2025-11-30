@@ -1,5 +1,5 @@
 # =============================================================================
-#  AQI PREDICTION API - Render (Using PKL directly)
+#  AQI PREDICTION API - Render Deployment (Gzip Compressed Model)
 # =============================================================================
 
 from fastapi import FastAPI, HTTPException
@@ -8,46 +8,50 @@ import numpy as np
 import pandas as pd
 import requests
 import xgboost as xgb
-import joblib
 from datetime import datetime
 from pathlib import Path
+import gzip
+import tempfile
 import os
-
-# =============================================================================
-# DEFINE WRAPPER CLASS (MUST BE BEFORE LOADING PKL)
-# =============================================================================
-class OptimizedXGBoostWrapper:
-    """Wrapper class - must match the one used when saving"""
-    def __init__(self, model, feature_names, best_iteration):
-        self.model = model
-        self.feature_names = feature_names
-        self.best_iteration = best_iteration
-        self._estimator_type = "regressor"
-        
-    def predict(self, X):
-        if isinstance(X, pd.DataFrame):
-            X = X[self.feature_names].values
-        X = np.asarray(X, dtype=np.float32)
-        dmatrix = xgb.DMatrix(X, feature_names=self.feature_names)
-        return self.model.predict(dmatrix, iteration_range=(0, self.best_iteration + 1))
 
 # =============================================================================
 # LOAD MODEL
 # =============================================================================
 MODEL_DIR = Path("./models")
 
-print("🚀 Starting AQI API...")
+print("🚀 Starting AQI Prediction API...")
+print("=" * 70)
 
-# Load PKL directly (6.6 MB - smallest!)
-model = joblib.load(MODEL_DIR / "xgboost_improved_lzma.pkl")
-print("✓ Model loaded: xgboost_improved_lzma.pkl")
+# Load gzipped JSON model
+print("📦 Loading compressed model...")
+try:
+    with gzip.open(MODEL_DIR / "model.json.gz", 'rb') as f:
+        model_bytes = f.read()
+    
+    # Write to temporary file and load
+    with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp:
+        tmp.write(model_bytes)
+        tmp_path = tmp.name
+    
+    model = xgb.Booster()
+    model.load_model(tmp_path)
+    os.unlink(tmp_path)  # Clean up temp file
+    print("✓ Model loaded successfully")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    raise
 
-# Get feature names from the wrapper
-FEATURE_COLS = model.feature_names
-print(f"✓ Features: {len(FEATURE_COLS)}")
+# Load feature names
+try:
+    with open(MODEL_DIR / "features.txt", 'r') as f:
+        FEATURE_COLS = [line.strip() for line in f.readlines()]
+    print(f"✓ Features loaded: {len(FEATURE_COLS)} features")
+except Exception as e:
+    print(f"❌ Error loading features: {e}")
+    raise
 
 # =============================================================================
-# CITY DATA
+# CITY DATA (29 Major Indian Cities)
 # =============================================================================
 CITIES = {
     "Agartala": {"lat": 23.8315, "lon": 91.2868, "state": "Tripura"},
@@ -81,16 +85,22 @@ CITIES = {
     "Visakhapatnam": {"lat": 17.6868, "lon": 83.2185, "state": "Andhra Pradesh"},
 }
 
+# Encodings
 CITY_ENC = {c: i for i, c in enumerate(sorted(CITIES.keys()))}
 STATES = sorted(set(v['state'] for v in CITIES.values()))
 STATE_ENC = {s: i for i, s in enumerate(STATES)}
 
-print(f"✓ Cities: {len(CITIES)}")
+print(f"✓ Cities loaded: {len(CITIES)} cities across {len(STATES)} states")
+print("=" * 70)
 
 # =============================================================================
 # FASTAPI APP
 # =============================================================================
-app = FastAPI(title="AQI API", version="2.0.0")
+app = FastAPI(
+    title="AQI Prediction API",
+    description="Real-time Air Quality Index predictions for major Indian cities",
+    version="2.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,200 +111,272 @@ app.add_middleware(
 )
 
 # =============================================================================
-# HELPERS
+# HELPER FUNCTIONS
 # =============================================================================
 def aqi_category(aqi):
-    if aqi <= 50: return {"cat": "Good", "emoji": "🟢", "color": "#00e400"}
-    if aqi <= 100: return {"cat": "Moderate", "emoji": "🟡", "color": "#ffff00"}
-    if aqi <= 150: return {"cat": "Unhealthy for Sensitive", "emoji": "🟠", "color": "#ff7e00"}
-    if aqi <= 200: return {"cat": "Unhealthy", "emoji": "🔴", "color": "#ff0000"}
-    if aqi <= 300: return {"cat": "Very Unhealthy", "emoji": "🟣", "color": "#8f3f97"}
-    return {"cat": "Hazardous", "emoji": "🟤", "color": "#7e0023"}
+    """Categorize AQI value with emoji and color"""
+    if aqi <= 50:
+        return {"cat": "Good", "emoji": "🟢", "color": "#00e400"}
+    elif aqi <= 100:
+        return {"cat": "Moderate", "emoji": "🟡", "color": "#ffff00"}
+    elif aqi <= 150:
+        return {"cat": "Unhealthy for Sensitive", "emoji": "🟠", "color": "#ff7e00"}
+    elif aqi <= 200:
+        return {"cat": "Unhealthy", "emoji": "🔴", "color": "#ff0000"}
+    elif aqi <= 300:
+        return {"cat": "Very Unhealthy", "emoji": "🟣", "color": "#8f3f97"}
+    else:
+        return {"cat": "Hazardous", "emoji": "🟤", "color": "#7e0023"}
 
 
 def fetch_data(lat, lon, days=2):
+    """Fetch weather and air quality data from Open-Meteo APIs"""
     try:
-        w = requests.get(
+        # Weather data
+        weather = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": lat, "longitude": lon,
+                "latitude": lat,
+                "longitude": lon,
                 "hourly": "relative_humidity_2m,dew_point_2m,wind_gusts_10m,precipitation,pressure_msl,cloud_cover",
-                "timezone": "Asia/Kolkata", "forecast_days": days
+                "timezone": "Asia/Kolkata",
+                "forecast_days": days
             },
             timeout=30
         ).json()
         
-        a = requests.get(
+        # Air quality data
+        air_quality = requests.get(
             "https://air-quality-api.open-meteo.com/v1/air-quality",
             params={
-                "latitude": lat, "longitude": lon,
+                "latitude": lat,
+                "longitude": lon,
                 "hourly": "pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,dust,aerosol_optical_depth",
-                "timezone": "Asia/Kolkata", "forecast_days": days
+                "timezone": "Asia/Kolkata",
+                "forecast_days": days
             },
             timeout=30
         ).json()
         
-        return w, a
-    except:
+        return weather, air_quality
+    except Exception as e:
+        print(f"Error fetching data: {e}")
         return None, None
 
 
-def safe_get(d, k, i, default, n):
+def safe_get(data_dict, key, index, default, total_length):
+    """Safely extract value from API response with fallback"""
     try:
-        v = d.get(k, [default]*n)[i]
-        return v if v is not None else default
-    except:
+        value = data_dict.get(key, [default] * total_length)[index]
+        return value if value is not None else default
+    except (IndexError, KeyError):
         return default
 
 
-def prepare(w, a, city):
-    info = CITIES[city]
-    wh = w.get('hourly', {})
-    ah = a.get('hourly', {})
-    n = len(wh.get('time', []))
+def prepare_features(weather, air_quality, city):
+    """Prepare feature dataframe from API data"""
+    city_info = CITIES[city]
+    weather_hourly = weather.get('hourly', {})
+    air_hourly = air_quality.get('hourly', {})
+    n_hours = len(weather_hourly.get('time', []))
     
-    if n == 0:
+    if n_hours == 0:
         return None
     
     rows = []
-    for i in range(n):
-        dt = pd.to_datetime(wh['time'][i])
-        p = safe_get(wh, 'precipitation', i, 0, n)
+    for i in range(n_hours):
+        dt = pd.to_datetime(weather_hourly['time'][i])
+        precip = safe_get(weather_hourly, 'precipitation', i, 0, n_hours)
         
         rows.append({
             'datetime': dt,
             'hour': dt.hour,
-            'o3_ugm3': safe_get(ah, 'ozone', i, 50, n),
-            'pressure_msl_hpa': safe_get(wh, 'pressure_msl', i, 1013, n),
-            'heavy_rain': 1 if p > 7.5 else 0,
-            'co_ugm3': safe_get(ah, 'carbon_monoxide', i, 500, n),
-            'latitude': info['lat'],
-            'humidity_percent': safe_get(wh, 'relative_humidity_2m', i, 60, n),
-            'city_encoded': CITY_ENC.get(city, 0),
-            'so2_ugm3': safe_get(ah, 'sulphur_dioxide', i, 10, n),
-            'precipitation_mm': p,
-            'dust_ugm3': safe_get(ah, 'dust', i, 10, n),
-            'pm2_5_ugm3': safe_get(ah, 'pm2_5', i, 50, n),
-            'wind_gusts_kmh': safe_get(wh, 'wind_gusts_10m', i, 20, n),
-            'aod': safe_get(ah, 'aerosol_optical_depth', i, 0.3, n),
-            'state_encoded': STATE_ENC.get(info['state'], 0),
-            'pm10_ugm3': safe_get(ah, 'pm10', i, 80, n),
-            'longitude': info['lon'],
-            'is_raining': 1 if p > 0 else 0,
-            'cloud_cover_percent': safe_get(wh, 'cloud_cover', i, 30, n),
+            'month': dt.month,
             'is_weekend': 1 if dt.dayofweek >= 5 else 0,
-            'dew_point_c': safe_get(wh, 'dew_point_2m', i, 15, n),
-            'no2_ugm3': safe_get(ah, 'nitrogen_dioxide', i, 30, n),
-            'month': dt.month
+            'latitude': city_info['lat'],
+            'longitude': city_info['lon'],
+            'city_encoded': CITY_ENC.get(city, 0),
+            'state_encoded': STATE_ENC.get(city_info['state'], 0),
+            'o3_ugm3': safe_get(air_hourly, 'ozone', i, 50, n_hours),
+            'pm2_5_ugm3': safe_get(air_hourly, 'pm2_5', i, 50, n_hours),
+            'pm10_ugm3': safe_get(air_hourly, 'pm10', i, 80, n_hours),
+            'co_ugm3': safe_get(air_hourly, 'carbon_monoxide', i, 500, n_hours),
+            'no2_ugm3': safe_get(air_hourly, 'nitrogen_dioxide', i, 30, n_hours),
+            'so2_ugm3': safe_get(air_hourly, 'sulphur_dioxide', i, 10, n_hours),
+            'dust_ugm3': safe_get(air_hourly, 'dust', i, 10, n_hours),
+            'aod': safe_get(air_hourly, 'aerosol_optical_depth', i, 0.3, n_hours),
+            'humidity_percent': safe_get(weather_hourly, 'relative_humidity_2m', i, 60, n_hours),
+            'dew_point_c': safe_get(weather_hourly, 'dew_point_2m', i, 15, n_hours),
+            'wind_gusts_kmh': safe_get(weather_hourly, 'wind_gusts_10m', i, 20, n_hours),
+            'precipitation_mm': precip,
+            'is_raining': 1 if precip > 0 else 0,
+            'heavy_rain': 1 if precip > 7.5 else 0,
+            'pressure_msl_hpa': safe_get(weather_hourly, 'pressure_msl', i, 1013, n_hours),
+            'cloud_cover_percent': safe_get(weather_hourly, 'cloud_cover', i, 30, n_hours),
         })
     
     return pd.DataFrame(rows)
 
 
+def predict_aqi(df):
+    """Generate AQI predictions from feature dataframe"""
+    X = df[FEATURE_COLS].values.astype(np.float32)
+    X = np.nan_to_num(X, nan=0.0)
+    dmatrix = xgb.DMatrix(X, feature_names=FEATURE_COLS)
+    return model.predict(dmatrix)
+
+
 # =============================================================================
-# ENDPOINTS
+# API ENDPOINTS
 # =============================================================================
 @app.get("/")
 def root():
+    """API root endpoint"""
     return {
         "status": "ok",
-        "api": "AQI Prediction",
+        "api": "AQI Prediction API",
         "version": "2.0.0",
-        "model_size": "6.6 MB",
         "cities": len(CITIES),
-        "docs": "/docs"
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "time": datetime.now().isoformat()}
-
-
-@app.get("/cities")
-def cities():
-    return {
-        "total": len(CITIES),
-        "cities": [{"name": c, "state": v["state"]} for c, v in sorted(CITIES.items())]
-    }
-
-
-@app.get("/predict/{city}")
-def predict(city: str, days: int = 2):
-    if city not in CITIES:
-        raise HTTPException(400, f"City not found. Available: {list(CITIES.keys())}")
-    
-    days = max(1, min(5, days))
-    info = CITIES[city]
-    
-    w, a = fetch_data(info['lat'], info['lon'], days)
-    if not w or not a:
-        raise HTTPException(503, "Failed to fetch data")
-    
-    df = prepare(w, a, city)
-    if df is None or len(df) == 0:
-        raise HTTPException(500, "No data")
-    
-    # Use wrapper's predict method directly
-    X = df[FEATURE_COLS].values.astype(np.float32)
-    X = np.nan_to_num(X, nan=0)
-    preds = model.predict(X)
-    df['aqi'] = preds
-    
-    hourly = []
-    for _, r in df.iterrows():
-        c = aqi_category(r['aqi'])
-        hourly.append({
-            "datetime": r['datetime'].isoformat(),
-            "hour": int(r['hour']),
-            "aqi": round(float(r['aqi']), 1),
-            "category": c["cat"],
-            "emoji": c["emoji"],
-            "color": c["color"],
-            "pm2_5": round(float(r['pm2_5_ugm3']), 1),
-            "pm10": round(float(r['pm10_ugm3']), 1),
-            "o3": round(float(r['o3_ugm3']), 1),
-            "humidity": round(float(r['humidity_percent']), 1)
-        })
-    
-    avg = float(preds.mean())
-    c = aqi_category(avg)
-    
-    df['date'] = df['datetime'].dt.date
-    daily = []
-    for date, g in df.groupby('date'):
-        dc = aqi_category(g['aqi'].mean())
-        daily.append({
-            "date": str(date),
-            "avg": round(float(g['aqi'].mean()), 1),
-            "max": round(float(g['aqi'].max()), 1),
-            "min": round(float(g['aqi'].min()), 1),
-            "category": dc["cat"],
-            "emoji": dc["emoji"]
-        })
-    
-    return {
-        "success": True,
-        "city": city,
-        "state": info['state'],
-        "lat": info['lat'],
-        "lon": info['lon'],
-        "days": days,
-        "generated": datetime.now().isoformat(),
-        "hourly": hourly,
-        "daily": daily,
-        "summary": {
-            "avg": round(avg, 1),
-            "max": round(float(preds.max()), 1),
-            "min": round(float(preds.min()), 1),
-            "category": c["cat"],
-            "emoji": c["emoji"],
-            "color": c["color"],
-            "hours": len(hourly)
+        "endpoints": {
+            "docs": "/docs",
+            "health": "/health",
+            "cities": "/cities",
+            "predict": "/predict/{city}"
         }
     }
 
 
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "model": "loaded",
+        "cities": len(CITIES)
+    }
+
+
+@app.get("/cities")
+def get_cities():
+    """Get list of available cities"""
+    return {
+        "total": len(CITIES),
+        "cities": [
+            {"name": city, "state": info["state"], "lat": info["lat"], "lon": info["lon"]}
+            for city, info in sorted(CITIES.items())
+        ],
+        "states": STATES
+    }
+
+
+@app.get("/predict/{city}")
+def predict_city_aqi(city: str, days: int = 2):
+    """
+    Predict AQI for a specific city
+    
+    Parameters:
+    - city: City name (case-sensitive)
+    - days: Number of forecast days (1-5, default 2)
+    """
+    # Validate city
+    if city not in CITIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"City '{city}' not found. Available cities: {list(CITIES.keys())}"
+        )
+    
+    # Validate days
+    days = max(1, min(5, days))
+    city_info = CITIES[city]
+    
+    # Fetch data
+    weather, air_quality = fetch_data(city_info['lat'], city_info['lon'], days)
+    if not weather or not air_quality:
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to fetch weather/air quality data. Please try again."
+        )
+    
+    # Prepare features
+    df = prepare_features(weather, air_quality, city)
+    if df is None or len(df) == 0:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process data. No valid entries found."
+        )
+    
+    # Generate predictions
+    predictions = predict_aqi(df)
+    df['aqi'] = predictions
+    
+    # Build hourly forecast
+    hourly_forecast = []
+    for _, row in df.iterrows():
+        category = aqi_category(row['aqi'])
+        hourly_forecast.append({
+            "datetime": row['datetime'].isoformat(),
+            "hour": int(row['hour']),
+            "aqi": round(float(row['aqi']), 1),
+            "category": category["cat"],
+            "emoji": category["emoji"],
+            "color": category["color"],
+            "pm2_5": round(float(row['pm2_5_ugm3']), 1),
+            "pm10": round(float(row['pm10_ugm3']), 1),
+            "o3": round(float(row['o3_ugm3']), 1),
+            "no2": round(float(row['no2_ugm3']), 1),
+            "so2": round(float(row['so2_ugm3']), 1),
+            "co": round(float(row['co_ugm3']), 1),
+            "humidity": round(float(row['humidity_percent']), 1),
+            "wind_gusts": round(float(row['wind_gusts_kmh']), 1)
+        })
+    
+    # Build daily summary
+    df['date'] = df['datetime'].dt.date
+    daily_summary = []
+    for date, group in df.groupby('date'):
+        daily_cat = aqi_category(group['aqi'].mean())
+        daily_summary.append({
+            "date": str(date),
+            "avg_aqi": round(float(group['aqi'].mean()), 1),
+            "max_aqi": round(float(group['aqi'].max()), 1),
+            "min_aqi": round(float(group['aqi'].min()), 1),
+            "category": daily_cat["cat"],
+            "emoji": daily_cat["emoji"],
+            "color": daily_cat["color"]
+        })
+    
+    # Overall summary
+    avg_aqi = float(predictions.mean())
+    overall_category = aqi_category(avg_aqi)
+    
+    return {
+        "success": True,
+        "city": city,
+        "state": city_info['state'],
+        "coordinates": {
+            "lat": city_info['lat'],
+            "lon": city_info['lon']
+        },
+        "forecast_days": days,
+        "generated_at": datetime.now().isoformat(),
+        "hourly": hourly_forecast,
+        "daily": daily_summary,
+        "summary": {
+            "avg_aqi": round(avg_aqi, 1),
+            "max_aqi": round(float(predictions.max()), 1),
+            "min_aqi": round(float(predictions.min()), 1),
+            "category": overall_category["cat"],
+            "emoji": overall_category["emoji"],
+            "color": overall_category["color"],
+            "total_hours": len(hourly_forecast)
+        }
+    }
+
+
+# =============================================================================
+# RUN SERVER
+# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))

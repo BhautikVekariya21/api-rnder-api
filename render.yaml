@@ -1,9 +1,12 @@
 services:
   - type: web
-    name: aqi-api
+    name: aqi-prediction-api
     runtime: python
     region: singapore
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
