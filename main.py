@@ -1,5 +1,5 @@
 # =============================================================================
-#  AQI PREDICTION API - Render Free Tier
+#  AQI PREDICTION API - Render (Using PKL directly)
 # =============================================================================
 
 from fastapi import FastAPI, HTTPException
@@ -8,9 +8,28 @@ import numpy as np
 import pandas as pd
 import requests
 import xgboost as xgb
+import joblib
 from datetime import datetime
 from pathlib import Path
 import os
+
+# =============================================================================
+# DEFINE WRAPPER CLASS (MUST BE BEFORE LOADING PKL)
+# =============================================================================
+class OptimizedXGBoostWrapper:
+    """Wrapper class - must match the one used when saving"""
+    def __init__(self, model, feature_names, best_iteration):
+        self.model = model
+        self.feature_names = feature_names
+        self.best_iteration = best_iteration
+        self._estimator_type = "regressor"
+        
+    def predict(self, X):
+        if isinstance(X, pd.DataFrame):
+            X = X[self.feature_names].values
+        X = np.asarray(X, dtype=np.float32)
+        dmatrix = xgb.DMatrix(X, feature_names=self.feature_names)
+        return self.model.predict(dmatrix, iteration_range=(0, self.best_iteration + 1))
 
 # =============================================================================
 # LOAD MODEL
@@ -19,12 +38,12 @@ MODEL_DIR = Path("./models")
 
 print("🚀 Starting AQI API...")
 
-model = xgb.XGBRegressor()
-model.load_model(str(MODEL_DIR / "xgboost_optimized.json"))
-print("✓ Model loaded")
+# Load PKL directly (6.6 MB - smallest!)
+model = joblib.load(MODEL_DIR / "xgboost_improved_lzma.pkl")
+print("✓ Model loaded: xgboost_improved_lzma.pkl")
 
-with open(MODEL_DIR / "feature_names.txt", 'r') as f:
-    FEATURE_COLS = [line.strip() for line in f.readlines()]
+# Get feature names from the wrapper
+FEATURE_COLS = model.feature_names
 print(f"✓ Features: {len(FEATURE_COLS)}")
 
 # =============================================================================
@@ -71,7 +90,7 @@ print(f"✓ Cities: {len(CITIES)}")
 # =============================================================================
 # FASTAPI APP
 # =============================================================================
-app = FastAPI(title="AQI API", version="1.0.0")
+app = FastAPI(title="AQI API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -180,6 +199,8 @@ def root():
     return {
         "status": "ok",
         "api": "AQI Prediction",
+        "version": "2.0.0",
+        "model_size": "6.6 MB",
         "cities": len(CITIES),
         "docs": "/docs"
     }
@@ -214,6 +235,7 @@ def predict(city: str, days: int = 2):
     if df is None or len(df) == 0:
         raise HTTPException(500, "No data")
     
+    # Use wrapper's predict method directly
     X = df[FEATURE_COLS].values.astype(np.float32)
     X = np.nan_to_num(X, nan=0)
     preds = model.predict(X)
@@ -238,7 +260,6 @@ def predict(city: str, days: int = 2):
     avg = float(preds.mean())
     c = aqi_category(avg)
     
-    # Daily summary
     df['date'] = df['datetime'].dt.date
     daily = []
     for date, g in df.groupby('date'):
@@ -274,9 +295,6 @@ def predict(city: str, days: int = 2):
     }
 
 
-# =============================================================================
-# RUN
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 10000))
